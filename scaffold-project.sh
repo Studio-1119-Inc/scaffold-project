@@ -15,6 +15,43 @@ ok()    { echo -e "${GREEN}✓${NC} $*"; }
 warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
 die()   { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
 
+# Run a command in the background with a spinner and message
+# Usage: run_with_spinner "message" command arg1 arg2 ...
+# To redirect stdout: run_with_spinner "message" --stdout file command arg1 ...
+run_with_spinner() {
+  local msg="$1"; shift
+  local outfile=""
+  if [[ "$1" == "--stdout" ]]; then
+    outfile="$2"; shift 2
+  fi
+  local tmpout errfile
+  tmpout=$(mktemp)
+  errfile=$(mktemp)
+  "$@" > "$tmpout" 2>"$errfile" &
+  local pid=$!
+  local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  ${CYAN}%s${NC} %s" "${spin:i++%${#spin}:1}" "$msg"
+    sleep 0.15
+  done
+  printf "\r\033[K"
+  if ! wait "$pid"; then
+    echo -e "${RED}✗${NC} Command failed:" >&2
+    [[ -s "$errfile" ]] && cat "$errfile" >&2
+    [[ -s "$tmpout" ]] && cat "$tmpout" >&2
+    rm -f "$tmpout" "$errfile"
+    return 1
+  fi
+  rm -f "$errfile"
+  if [[ -n "$outfile" ]]; then
+    mv "$tmpout" "$outfile"
+  else
+    cat "$tmpout"
+    rm -f "$tmpout"
+  fi
+}
+
 # ─── Usage ────────────────────────────────────────────────────────────────────
 
 usage() {
@@ -108,7 +145,7 @@ DESCEOF
 
   EDITOR="${EDITOR:-vi}"
   echo -e "${BOLD}Opening $EDITOR to write your project description...${NC}"
-  "$EDITOR" "$DESC_TMPFILE"
+  $EDITOR "$DESC_TMPFILE"
 
   # Strip comment lines and check we got something
   DESCRIPTION=$(grep -v '^#' "$DESC_TMPFILE" | grep -v '^(Delete these' | sed '/^$/N;/^\n$/d' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -156,35 +193,39 @@ Naming guidelines:
 - Name should be clear to developers about what the project does
 - No conflicts with existing projects
 
-Have a natural discussion. Propose name ideas, explain your reasoning, and ask for the user's preference. When the user has decided, output the final names in this exact format (the scaffold script will parse this):
+Have a natural discussion. Propose name ideas, explain your reasoning, and ask for the user's preference. When the user has decided, use the Write tool to save the final names to this exact path:
 
-FINAL_NAMES:
+$TMPDIR_SCAFFOLD/final-names.txt
+
+The file must contain exactly these lines (no extra text):
 PROJECT_NAME=<value>
 GCP_PREFIX=<value>
 DB_NAME=<value>
 TARGET_DIR=<value>
+
+After writing the file, confirm to the user that the names have been saved and they can exit.
 SYSPROMPTEOF
 
 # Run interactive Claude session — user discusses naming in their terminal
-# The session output (including FINAL_NAMES) is captured via tee
-NAMING_LOG="$TMPDIR_SCAFFOLD/naming-output.log"
+NAMES_FILE="$TMPDIR_SCAFFOLD/final-names.txt"
 claude \
   --system-prompt "$(cat "$TMPDIR_SCAFFOLD/naming-system-prompt.md")" \
+  --allowedTools "Write" \
+  --permission-mode bypassPermissions \
   --model sonnet \
-  --max-budget-usd 0.50 \
-  2>&1 | tee "$NAMING_LOG"
+  --max-budget-usd 0.50 || true
 
 echo ""
 
-# Parse the final names from the conversation
-if grep -q "FINAL_NAMES:" "$NAMING_LOG"; then
-  PROJECT_NAME=$(grep "^PROJECT_NAME=" "$NAMING_LOG" | tail -1 | cut -d= -f2-)
-  GCP_PREFIX=$(grep "^GCP_PREFIX=" "$NAMING_LOG" | tail -1 | cut -d= -f2-)
-  DB_NAME=$(grep "^DB_NAME=" "$NAMING_LOG" | tail -1 | cut -d= -f2-)
-  TARGET_DIR=$(grep "^TARGET_DIR=" "$NAMING_LOG" | tail -1 | cut -d= -f2-)
+# Parse the final names from the file Claude wrote
+if [[ -f "$NAMES_FILE" ]]; then
+  PROJECT_NAME=$(grep "^PROJECT_NAME=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
+  GCP_PREFIX=$(grep "^GCP_PREFIX=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
+  DB_NAME=$(grep "^DB_NAME=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
+  TARGET_DIR=$(grep "^TARGET_DIR=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
 else
   echo ""
-  echo -e "${YELLOW}Could not parse names from the discussion. Please enter them manually:${NC}"
+  echo -e "${YELLOW}Names file not found. Please enter them manually:${NC}"
   read -rp "  Project name: " PROJECT_NAME
   read -rp "  GCP prefix [$PROJECT_NAME]: " GCP_PREFIX
   [[ -z "$GCP_PREFIX" ]] && GCP_PREFIX="$PROJECT_NAME"
@@ -212,12 +253,8 @@ echo ""
 echo -e "${YELLOW}Press Enter to continue with these names (or Ctrl+C to abort).${NC}"
 read -r
 
-# Check target doesn't exist
-[[ -e "$TARGET_DIR" ]] && die "Target directory already exists: $TARGET_DIR"
-
-# Create target + scaffold workspace
+# Create target + scaffold workspace (preserve existing for incremental runs)
 mkdir -p "$TARGET_DIR/.scaffold"
-ok "Created target directory"
 
 # Persist description for later phases
 echo "$DESCRIPTION" > "$TARGET_DIR/.scaffold/description.txt"
@@ -226,12 +263,16 @@ echo ""
 
 # ─── Phase 1: Inventory & Plan ───────────────────────────────────────────────
 
-echo -e "${BOLD}Phase 1: Analyzing reference project...${NC}"
-info "Claude will explore the reference project and classify every file."
-echo ""
+if [[ -f "$TARGET_DIR/.scaffold/plan.json" ]] && python3 -c "import json; json.load(open('$TARGET_DIR/.scaffold/plan.json'))" 2>/dev/null; then
+  ok "Phase 1: Using existing plan from previous run"
+  info "Delete $TARGET_DIR/.scaffold/plan.json to regenerate"
+else
+  echo -e "${BOLD}Phase 1: Analyzing reference project...${NC}"
+  info "Claude will explore the reference project and classify every file."
+  echo ""
 
-PHASE1_PROMPT_FILE="$TMPDIR_SCAFFOLD/phase1-prompt.txt"
-cat > "$PHASE1_PROMPT_FILE" <<PROMPTEOF
+  PHASE1_PROMPT_FILE="$TMPDIR_SCAFFOLD/phase1-prompt.txt"
+  cat > "$PHASE1_PROMPT_FILE" <<PROMPTEOF
 Analyze the reference project at: $REFERENCE_DIR
 
 The new project is:
@@ -253,19 +294,23 @@ Explore the reference project thoroughly and produce the JSON plan. Remember:
 - Be thorough but practical — scan directories, read key files, classify intelligently
 PROMPTEOF
 
-claude -p \
-  --system-prompt "$(cat "$SCAFFOLD_DIR/phase1-inventory.md")" \
-  --allowedTools "Read,Glob,Grep" \
-  --permission-mode bypassPermissions \
-  --model sonnet \
-  --max-budget-usd 1.00 \
-  "$(cat "$PHASE1_PROMPT_FILE")" > "$TARGET_DIR/.scaffold/plan.json"
+  PHASE1_SYSTEM_PROMPT="$(cat "$SCAFFOLD_DIR/phase1-inventory.md")"
+  PHASE1_PROMPT="$(cat "$PHASE1_PROMPT_FILE")"
+  run_with_spinner "Analyzing project (this may take a few minutes)..." \
+    --stdout "$TARGET_DIR/.scaffold/plan.json" \
+    claude -p \
+      --system-prompt "$PHASE1_SYSTEM_PROMPT" \
+      --allowedTools "Read,Glob,Grep" \
+      --permission-mode bypassPermissions \
+      --model sonnet \
+      --max-budget-usd 2.00 \
+      "$PHASE1_PROMPT"
 
-# Validate we got JSON
-if ! python3 -c "import json; json.load(open('$TARGET_DIR/.scaffold/plan.json'))" 2>/dev/null; then
-  warn "Plan output may contain non-JSON content. Attempting to extract JSON..."
-  # Try to extract JSON from the output (Claude might add commentary)
-  python3 -c "
+  # Validate we got JSON
+  if ! python3 -c "import json; json.load(open('$TARGET_DIR/.scaffold/plan.json'))" 2>/dev/null; then
+    warn "Plan output may contain non-JSON content. Attempting to extract JSON..."
+    # Try to extract JSON from the output (Claude might add commentary)
+    python3 -c "
 import json, re, sys
 text = open('$TARGET_DIR/.scaffold/plan.json').read()
 # Find the first { and last }
@@ -283,9 +328,10 @@ else:
     print('No JSON found in output', file=sys.stderr)
     sys.exit(1)
 " || die "Phase 1 did not produce valid JSON. Check $TARGET_DIR/.scaffold/plan.json"
-fi
+  fi
 
-ok "Plan generated: $TARGET_DIR/.scaffold/plan.json"
+  ok "Plan generated: $TARGET_DIR/.scaffold/plan.json"
+fi
 
 # Display summary
 echo ""
@@ -395,21 +441,36 @@ echo -e "${BOLD}Phase 2b: Generating stub files...${NC}"
 info "Claude will read reference patterns and generate minimal working stubs."
 echo ""
 
-# Extract stub files and guidance from plan
+# Extract stub files, filtering out ones that already exist in the target
 STUB_INFO=$(python3 -c "
-import json
+import json, os
 plan = json.load(open('$TARGET_DIR/.scaffold/plan.json'))
 stubs = [f for f in plan.get('files', []) if f['action'] == 'stub']
 guidance = plan.get('stub_guidance', {})
-print('Stub files to generate:')
+target = '$TARGET_DIR'
+pending = []
+skipped = 0
 for s in stubs:
     path = s['path']
+    if os.path.exists(os.path.join(target, path)):
+        skipped += 1
+        continue
     guide = guidance.get(path, s.get('reason', 'Generate minimal working version'))
-    print(f'  - {path}: {guide}')
+    pending.append(f'  - {path}: {guide}')
+if skipped:
+    print(f'(Skipping {skipped} stubs that already exist)')
+if pending:
+    print('Stub files to generate:')
+    print('\n'.join(pending))
+else:
+    print('ALL_STUBS_DONE')
 ")
 
-PHASE2_PROMPT_FILE="$TMPDIR_SCAFFOLD/phase2-prompt.txt"
-cat > "$PHASE2_PROMPT_FILE" <<PROMPTEOF
+if [[ "$STUB_INFO" == *"ALL_STUBS_DONE"* ]]; then
+  ok "Phase 2b: All stubs already generated from previous run"
+else
+  PHASE2_PROMPT_FILE="$TMPDIR_SCAFFOLD/phase2-prompt.txt"
+  cat > "$PHASE2_PROMPT_FILE" <<PROMPTEOF
 Generate stub files for the new project.
 
 Reference project: $REFERENCE_DIR
@@ -429,24 +490,36 @@ For each stub file:
 Remember: the target already has copy/replace files in place. Your stubs should be consistent with them.
 PROMPTEOF
 
-claude -p \
-  --system-prompt "$(cat "$SCAFFOLD_DIR/phase2-scaffold.md")" \
-  --allowedTools "Read,Write,Glob" \
-  --permission-mode bypassPermissions \
-  --model sonnet \
-  --max-budget-usd 2.00 \
-  "$(cat "$PHASE2_PROMPT_FILE")"
-
-ok "Stub generation complete"
+  PHASE2_SYSTEM_PROMPT="$(cat "$SCAFFOLD_DIR/phase2-scaffold.md")"
+  PHASE2_PROMPT="$(cat "$PHASE2_PROMPT_FILE")"
+  if run_with_spinner "Generating stub files (this may take a few minutes)..." \
+    claude -p \
+      --system-prompt "$PHASE2_SYSTEM_PROMPT" \
+      --allowedTools "Read,Write,Glob" \
+      --permission-mode bypassPermissions \
+      --model sonnet \
+      --max-budget-usd 5.00 \
+      "$PHASE2_PROMPT"; then
+    ok "Stub generation complete"
+  else
+    warn "Stub generation did not fully complete (may have hit budget limit)"
+    info "Re-run the script to generate remaining stubs incrementally"
+  fi
+fi
 
 # ─── Phase 3: Generate CLAUDE.md ─────────────────────────────────────────────
 
 echo ""
-echo -e "${BOLD}Phase 3: Generating CLAUDE.md...${NC}"
-echo ""
 
-PHASE3_PROMPT_FILE="$TMPDIR_SCAFFOLD/phase3-prompt.txt"
-cat > "$PHASE3_PROMPT_FILE" <<PROMPTEOF
+if [[ -f "$TARGET_DIR/CLAUDE.md" ]] && [[ -s "$TARGET_DIR/CLAUDE.md" ]]; then
+  ok "Phase 3: CLAUDE.md already exists from previous run"
+  info "Delete $TARGET_DIR/CLAUDE.md to regenerate"
+else
+  echo -e "${BOLD}Phase 3: Generating CLAUDE.md...${NC}"
+  echo ""
+
+  PHASE3_PROMPT_FILE="$TMPDIR_SCAFFOLD/phase3-prompt.txt"
+  cat > "$PHASE3_PROMPT_FILE" <<PROMPTEOF
 Generate a CLAUDE.md for the project at: $TARGET_DIR
 
 Project name: $PROJECT_NAME
@@ -456,15 +529,20 @@ $(cat "$TARGET_DIR/.scaffold/description.txt")
 Read the scaffolded project files and generate the CLAUDE.md content. Output raw markdown only — no wrapping code fences.
 PROMPTEOF
 
-claude -p \
-  --system-prompt "$(cat "$SCAFFOLD_DIR/phase3-claudemd.md")" \
-  --allowedTools "Read,Glob" \
-  --permission-mode bypassPermissions \
-  --model sonnet \
-  --max-budget-usd 0.50 \
-  "$(cat "$PHASE3_PROMPT_FILE")" > "$TARGET_DIR/CLAUDE.md"
+  PHASE3_SYSTEM_PROMPT="$(cat "$SCAFFOLD_DIR/phase3-claudemd.md")"
+  PHASE3_PROMPT="$(cat "$PHASE3_PROMPT_FILE")"
+  run_with_spinner "Generating CLAUDE.md..." \
+    --stdout "$TARGET_DIR/CLAUDE.md" \
+    claude -p \
+      --system-prompt "$PHASE3_SYSTEM_PROMPT" \
+      --allowedTools "Read,Glob" \
+      --permission-mode bypassPermissions \
+      --model sonnet \
+      --max-budget-usd 1.00 \
+      "$PHASE3_PROMPT"
 
-ok "CLAUDE.md generated"
+  ok "CLAUDE.md generated"
+fi
 
 # ─── Phase 4: Post-scaffold Init ─────────────────────────────────────────────
 
@@ -474,11 +552,17 @@ echo -e "${BOLD}Phase 4: Initializing project...${NC}"
 cd "$TARGET_DIR"
 
 # Git init
-git init -q
-ok "Git repository initialized"
+if [[ -d ".git" ]]; then
+  ok "Git repository already initialized"
+else
+  git init -q
+  ok "Git repository initialized"
+fi
 
 # npm install
-if [[ -f "package.json" ]]; then
+if [[ -d "node_modules" ]]; then
+  ok "Dependencies already installed"
+elif [[ -f "package.json" ]]; then
   info "Running npm install..."
   npm install --loglevel=error 2>&1 | tail -5
   ok "Dependencies installed"
