@@ -85,7 +85,7 @@ Identify ALL naming patterns used in the reference project. Look for:
 
 ## Output Format
 
-Output ONLY valid JSON (no markdown fences, no commentary). The JSON must have this structure:
+When you have finished analyzing, use the Write tool to save the plan as a JSON file to the path specified in the user prompt. The file must contain ONLY valid JSON — no markdown, no commentary, no code fences. The JSON must have this structure:
 
 ```
 {

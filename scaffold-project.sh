@@ -56,9 +56,10 @@ run_with_spinner() {
 
 usage() {
   cat <<'EOF'
-Usage: scaffold-project.sh [--reference <path>] [--parent-dir <path>] [--description-file <path>]
+Usage: scaffold-project.sh [--name <name>] [--reference <path>] [--parent-dir <path>] [--description-file <path>]
 
 Options:
+  --name               Project name (skips interactive naming discussion)
   --reference          Path to the reference project to scaffold from
                        (default: ~/Projects/studio-1119/bigcommerce-aiseo)
   --parent-dir         Parent directory for the new project
@@ -68,7 +69,7 @@ Options:
 
 Example:
   ./scaffold-project.sh
-  ./scaffold-project.sh --description-file ~/project-idea.md
+  ./scaffold-project.sh --name myproject --description-file ~/project-idea.md
   ./scaffold-project.sh --reference ~/Projects/my-org/reference-app --parent-dir ~/Projects/my-org
 EOF
   exit 1
@@ -79,9 +80,11 @@ EOF
 REFERENCE_DIR="$HOME/Projects/studio-1119/bigcommerce-aiseo"
 PARENT_DIR="$HOME/Projects/studio-1119"
 DESCRIPTION_FILE=""
+PROJECT_NAME=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --name)              PROJECT_NAME="$2"; shift 2 ;;
     --reference)         REFERENCE_DIR="$2"; shift 2 ;;
     --parent-dir)        PARENT_DIR="$2"; shift 2 ;;
     --description-file)  DESCRIPTION_FILE="$2"; shift 2 ;;
@@ -158,18 +161,25 @@ echo -e "  ${BOLD}Description:${NC}"
 echo "$DESCRIPTION" | sed 's/^/    /'
 echo ""
 
-# ─── Naming Discussion (Interactive) ─────────────────────────────────────────
+# ─── Naming Discussion (Interactive or from --name) ──────────────────────────
 
-echo -e "${BOLD}Naming Discussion${NC}"
-info "Claude will help you choose a project name for the studio1119.ai portfolio."
-echo ""
+if [[ -n "$PROJECT_NAME" ]]; then
+  # Derive names from --name flag
+  GCP_PREFIX="$PROJECT_NAME"
+  DB_NAME="${PROJECT_NAME//-/_}"
+  TARGET_DIR="$PARENT_DIR/$PROJECT_NAME"
+  ok "Using project name from --name: $PROJECT_NAME"
+else
+  echo -e "${BOLD}Naming Discussion${NC}"
+  info "Claude will help you choose a project name for the studio1119.ai portfolio."
+  echo ""
 
-# Write description to a temp file so the system prompt doesn't break on special chars
-DESC_FILE="$TMPDIR_SCAFFOLD/description.txt"
-echo "$DESCRIPTION" > "$DESC_FILE"
+  # Write description to a temp file so the system prompt doesn't break on special chars
+  DESC_FILE="$TMPDIR_SCAFFOLD/description.txt"
+  echo "$DESCRIPTION" > "$DESC_FILE"
 
-# Build the system prompt from a heredoc to avoid quoting issues
-cat > "$TMPDIR_SCAFFOLD/naming-system-prompt.md" <<SYSPROMPTEOF
+  # Build the system prompt from a heredoc to avoid quoting issues
+  cat > "$TMPDIR_SCAFFOLD/naming-system-prompt.md" <<SYSPROMPTEOF
 You are helping name a new project in the studio1119.ai portfolio.
 
 The user wants to build:
@@ -206,42 +216,43 @@ TARGET_DIR=<value>
 After writing the file, confirm to the user that the names have been saved and they can exit.
 SYSPROMPTEOF
 
-# Run interactive Claude session — user discusses naming in their terminal
-NAMES_FILE="$TMPDIR_SCAFFOLD/final-names.txt"
-claude \
-  --system-prompt "$(cat "$TMPDIR_SCAFFOLD/naming-system-prompt.md")" \
-  --allowedTools "Write" \
-  --permission-mode bypassPermissions \
-  --model sonnet \
-  --max-budget-usd 0.50 || true
+  # Run interactive Claude session — user discusses naming in their terminal
+  NAMES_FILE="$TMPDIR_SCAFFOLD/final-names.txt"
+  claude \
+    --system-prompt "$(cat "$TMPDIR_SCAFFOLD/naming-system-prompt.md")" \
+    --allowedTools "Write" \
+    --permission-mode bypassPermissions \
+    --model sonnet \
+    --max-budget-usd 0.50 || true
 
-echo ""
-
-# Parse the final names from the file Claude wrote
-if [[ -f "$NAMES_FILE" ]]; then
-  PROJECT_NAME=$(grep "^PROJECT_NAME=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
-  GCP_PREFIX=$(grep "^GCP_PREFIX=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
-  DB_NAME=$(grep "^DB_NAME=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
-  TARGET_DIR=$(grep "^TARGET_DIR=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
-else
   echo ""
-  echo -e "${YELLOW}Names file not found. Please enter them manually:${NC}"
-  read -rp "  Project name: " PROJECT_NAME
-  read -rp "  GCP prefix [$PROJECT_NAME]: " GCP_PREFIX
-  [[ -z "$GCP_PREFIX" ]] && GCP_PREFIX="$PROJECT_NAME"
-  DB_NAME="${PROJECT_NAME//-/_}"
-  read -rp "  Database name [$DB_NAME]: " INPUT_DB_NAME
-  [[ -n "$INPUT_DB_NAME" ]] && DB_NAME="$INPUT_DB_NAME"
-  TARGET_DIR="$PARENT_DIR/$PROJECT_NAME"
-  read -rp "  Target directory [$TARGET_DIR]: " INPUT_TARGET
-  [[ -n "$INPUT_TARGET" ]] && TARGET_DIR="$INPUT_TARGET"
-fi
 
-# Validate we got names
-[[ -z "$PROJECT_NAME" ]] && die "No project name determined. Aborting."
-[[ -z "$GCP_PREFIX" ]] && GCP_PREFIX="$PROJECT_NAME"
-[[ -z "$DB_NAME" ]] && DB_NAME="${PROJECT_NAME//-/_}"
-[[ -z "$TARGET_DIR" ]] && TARGET_DIR="$PARENT_DIR/$PROJECT_NAME"
+  # Parse the final names from the file Claude wrote
+  if [[ -f "$NAMES_FILE" ]]; then
+    PROJECT_NAME=$(grep "^PROJECT_NAME=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
+    GCP_PREFIX=$(grep "^GCP_PREFIX=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
+    DB_NAME=$(grep "^DB_NAME=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
+    TARGET_DIR=$(grep "^TARGET_DIR=" "$NAMES_FILE" | tail -1 | cut -d= -f2-)
+  else
+    echo ""
+    echo -e "${YELLOW}Names file not found. Please enter them manually:${NC}"
+    read -rp "  Project name: " PROJECT_NAME
+    read -rp "  GCP prefix [$PROJECT_NAME]: " GCP_PREFIX
+    [[ -z "$GCP_PREFIX" ]] && GCP_PREFIX="$PROJECT_NAME"
+    DB_NAME="${PROJECT_NAME//-/_}"
+    read -rp "  Database name [$DB_NAME]: " INPUT_DB_NAME
+    [[ -n "$INPUT_DB_NAME" ]] && DB_NAME="$INPUT_DB_NAME"
+    TARGET_DIR="$PARENT_DIR/$PROJECT_NAME"
+    read -rp "  Target directory [$TARGET_DIR]: " INPUT_TARGET
+    [[ -n "$INPUT_TARGET" ]] && TARGET_DIR="$INPUT_TARGET"
+  fi
+
+  # Validate we got names
+  [[ -z "$PROJECT_NAME" ]] && die "No project name determined. Aborting."
+  [[ -z "$GCP_PREFIX" ]] && GCP_PREFIX="$PROJECT_NAME"
+  [[ -z "$DB_NAME" ]] && DB_NAME="${PROJECT_NAME//-/_}"
+  [[ -z "$TARGET_DIR" ]] && TARGET_DIR="$PARENT_DIR/$PROJECT_NAME"
+fi
 
 echo ""
 echo -e "  ${BOLD}Final names:${NC}"
@@ -292,28 +303,35 @@ Explore the reference project thoroughly and produce the JSON plan. Remember:
   - Display/title names -> appropriate casing of $PROJECT_NAME
 - Order replacements longest-first to avoid partial matches
 - Be thorough but practical — scan directories, read key files, classify intelligently
+
+CRITICAL: When you are done analyzing, use the Write tool to save the JSON plan to exactly this path:
+$TARGET_DIR/.scaffold/plan.json
+
+The file must contain ONLY valid JSON — no markdown, no commentary, no code fences.
+After writing the file, confirm that the plan has been saved.
 PROMPTEOF
 
   PHASE1_SYSTEM_PROMPT="$(cat "$SCAFFOLD_DIR/phase1-inventory.md")"
   PHASE1_PROMPT="$(cat "$PHASE1_PROMPT_FILE")"
   run_with_spinner "Analyzing project (this may take a few minutes)..." \
-    --stdout "$TARGET_DIR/.scaffold/plan.json" \
     claude -p \
       --system-prompt "$PHASE1_SYSTEM_PROMPT" \
-      --allowedTools "Read,Glob,Grep" \
+      --allowedTools "Read,Glob,Grep,Write" \
       --permission-mode bypassPermissions \
       --model sonnet \
       --max-budget-usd 2.00 \
       "$PHASE1_PROMPT"
 
   # Validate we got JSON
+  if ! [[ -f "$TARGET_DIR/.scaffold/plan.json" ]]; then
+    die "Phase 1 did not produce plan.json. Claude may have run out of budget."
+  fi
+
   if ! python3 -c "import json; json.load(open('$TARGET_DIR/.scaffold/plan.json'))" 2>/dev/null; then
     warn "Plan output may contain non-JSON content. Attempting to extract JSON..."
-    # Try to extract JSON from the output (Claude might add commentary)
     python3 -c "
-import json, re, sys
+import json, sys
 text = open('$TARGET_DIR/.scaffold/plan.json').read()
-# Find the first { and last }
 start = text.find('{')
 end = text.rfind('}')
 if start >= 0 and end > start:
@@ -583,11 +601,190 @@ else
   warn "Database ${DB_NAME}_test already exists (or creation failed)"
 fi
 
-# Write .env and .env.test for local development
-echo "DATABASE_URL=postgresql://localhost:5432/$DB_NAME" > .env
-ok "Created .env with DATABASE_URL"
-echo "DATABASE_URL=postgresql://localhost:5432/${DB_NAME}_test" > .env.test
-ok "Created .env.test with DATABASE_URL"
+# Initialize .claude/settings.local.json with common permissions
+mkdir -p .claude
+cat > .claude/settings.local.json <<'CLAUDEEOF'
+{
+  "permissions": {
+    "allow": [
+      "Bash(git:*)",
+      "Bash(npm run:*)",
+      "Bash(npm install:*)",
+      "Bash(npm ls:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npx vitest:*)",
+      "Bash(TEST_REPOS=1 npx vitest:*)",
+      "Bash(npx tsx:*)",
+      "Bash(psql:*)",
+      "Bash(python3:*)",
+      "Bash(bash:*)",
+      "Bash(curl:*)",
+      "Bash(terraform plan:*)",
+      "Bash(terraform fmt:*)",
+      "Bash(terraform validate:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh run watch:*)",
+      "Bash(gcloud run services describe:*)",
+      "Bash(gcloud run revisions describe:*)",
+      "Bash(gcloud logging read:*)"
+    ]
+  }
+}
+CLAUDEEOF
+ok "Created .claude/settings.local.json"
+
+# Write .env files for local development and GCP environments
+cat > .env <<ENVEOF
+# Local Development
+DATABASE_URL=postgresql://localhost:5432/$DB_NAME
+REDIS_URL=redis://127.0.0.1:6379
+
+# App Configuration
+NEXT_PUBLIC_APP_URL=https://localhost:3000
+NEXTAUTH_URL=https://localhost:3000
+NEXTAUTH_SECRET=
+
+# Google Cloud
+GOOGLE_CLOUD_PROJECT_ID=${GCP_PREFIX}-dev
+GOOGLE_CLOUD_LOCATION=us-central1
+SERVICE_NAME=${GCP_PREFIX}-dev
+
+# Security
+JWT_KEY=
+CRON_SECRET=
+
+# Email
+SMTP_HOST=send.smtp.com
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASSWORD=
+FROM_EMAIL=
+ACTIVITY_NOTIFICATION_EMAIL=
+ENVEOF
+ok "Created .env"
+
+cat > .env.test <<ENVEOF
+DATABASE_URL=postgresql://localhost:5432/${DB_NAME}_test
+NODE_ENV=test
+REDIS_URL=redis://127.0.0.1:6379
+NEXT_PUBLIC_APP_URL=https://localhost:3000
+ENVEOF
+ok "Created .env.test"
+
+cat > .env.gcp.production <<ENVEOF
+# Google Cloud Configuration for PRODUCTION
+GOOGLE_CLOUD_PROJECT_ID=${GCP_PREFIX}-production
+GOOGLE_CLOUD_LOCATION=us-central1
+SERVICE_NAME=${GCP_PREFIX}-prod
+SERVICE_ACCOUNT=${GCP_PREFIX}-prod@${GCP_PREFIX}-production.iam.gserviceaccount.com
+VPC_CONNECTOR=${GCP_PREFIX}-vpc-production
+VERTEX_AI_BUCKET=${GCP_PREFIX}-batch-production
+
+# Database Configuration
+DB_INSTANCE_NAME=${GCP_PREFIX}-prod-db
+DB_CONNECTION_NAME=${GCP_PREFIX}-production:us-central1:${GCP_PREFIX}-prod-db
+DB_NAME=${DB_NAME}_production
+DB_USER=${GCP_PREFIX}-prod-user
+DB_PASSWORD=
+DB_PRIVATE_IP=
+DATABASE_URL=
+VPC_CONNECTOR_NAME=${GCP_PREFIX}-vpc-production
+
+# Memorystore / Redis
+REDIS_URL=
+
+# App Configuration
+NEXT_PUBLIC_APP_URL=https://app.${PROJECT_NAME}.ai
+NEXTAUTH_URL=https://app.${PROJECT_NAME}.ai
+AUTH_CALLBACK=https://app.${PROJECT_NAME}.ai/api/auth
+NEXTAUTH_SECRET=
+
+# Email
+SMTP_HOST=send.smtp.com
+SMTP_PORT=587
+SMTP_USER=rob@studio1119.ai
+SMTP_PASSWORD=
+FROM_EMAIL=billing@${PROJECT_NAME}.ai
+ACTIVITY_NOTIFICATION_EMAIL=support@studio1119.ai
+
+# Security
+JWT_KEY=
+CRON_SECRET=
+ENVEOF
+ok "Created .env.gcp.production (https://app.${PROJECT_NAME}.ai)"
+
+cat > .env.gcp.staging <<ENVEOF
+# Google Cloud Configuration for STAGING
+GOOGLE_CLOUD_PROJECT_ID=${GCP_PREFIX}-staging
+GOOGLE_CLOUD_LOCATION=us-central1
+SERVICE_NAME=${GCP_PREFIX}-staging
+SERVICE_ACCOUNT=${GCP_PREFIX}-staging@${GCP_PREFIX}-staging.iam.gserviceaccount.com
+VPC_CONNECTOR=${GCP_PREFIX}-connector-staging
+VERTEX_AI_BUCKET=${GCP_PREFIX}-batch-staging
+
+# Database Configuration
+DB_INSTANCE_NAME=${GCP_PREFIX}-staging-db
+DB_CONNECTION_NAME=${GCP_PREFIX}-staging:us-central1:${GCP_PREFIX}-staging-db
+DB_NAME=${DB_NAME}_staging
+DB_USER=${GCP_PREFIX}-staging-user
+DB_PASSWORD=
+DB_PRIVATE_IP=
+DATABASE_URL=
+VPC_CONNECTOR_NAME=${GCP_PREFIX}-connector-staging
+
+# Memorystore / Redis
+REDIS_URL=
+
+# App Configuration
+NEXT_PUBLIC_APP_URL=https://app-staging.${PROJECT_NAME}.ai
+NEXTAUTH_URL=https://app-staging.${PROJECT_NAME}.ai
+AUTH_CALLBACK=https://app-staging.${PROJECT_NAME}.ai/api/auth
+NEXTAUTH_SECRET=
+
+# Email
+SMTP_HOST=send.smtp.com
+SMTP_PORT=587
+SMTP_USER=rob@studio1119.ai
+SMTP_PASSWORD=
+FROM_EMAIL=billing-staging@${PROJECT_NAME}.ai
+ACTIVITY_NOTIFICATION_EMAIL=
+
+# Security
+JWT_KEY=
+CRON_SECRET=
+ENVEOF
+ok "Created .env.gcp.staging (https://app-staging.${PROJECT_NAME}.ai)"
+
+cat > .env.gcp.dev <<ENVEOF
+# Google Cloud Configuration for DEV
+GOOGLE_CLOUD_PROJECT_ID=${GCP_PREFIX}-dev
+GOOGLE_CLOUD_LOCATION=us-central1
+SERVICE_NAME=${GCP_PREFIX}-dev
+SERVICE_ACCOUNT=${GCP_PREFIX}-dev@${GCP_PREFIX}-dev.iam.gserviceaccount.com
+VPC_CONNECTOR=${GCP_PREFIX}-connector-dev
+
+# Database Configuration
+DB_INSTANCE_NAME=${GCP_PREFIX}-dev-db
+DB_CONNECTION_NAME=${GCP_PREFIX}-dev:us-central1:${GCP_PREFIX}-dev-db
+DB_NAME=${DB_NAME}_dev
+DB_USER=${GCP_PREFIX}-dev-user
+DB_PASSWORD=
+DB_PRIVATE_IP=
+DATABASE_URL=
+VPC_CONNECTOR_NAME=${GCP_PREFIX}-connector-dev
+
+# App Configuration
+NEXT_PUBLIC_APP_URL=https://app-dev.${PROJECT_NAME}.ai
+NEXTAUTH_URL=https://app-dev.${PROJECT_NAME}.ai
+AUTH_CALLBACK=https://app-dev.${PROJECT_NAME}.ai/api/auth
+NEXTAUTH_SECRET=
+
+# Security
+JWT_KEY=
+CRON_SECRET=
+ENVEOF
+ok "Created .env.gcp.dev (https://app-dev.${PROJECT_NAME}.ai)"
 
 # Generate initial migration
 if [[ -f "mikro-orm.config.ts" ]] && command -v npx >/dev/null 2>&1; then
